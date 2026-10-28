@@ -522,6 +522,84 @@ window.MLO = window.MLO || {};
         let best = null; bins.forEach(b => { if (!best || b.w > best.w) best = b; });
         return best ? Math.round(best.s / best.w * 100) / 100 : null;
     };
+    // One button for the grid, the floor, the walls and the ceiling: the grid is squared to the selected building's walls and put on its floor, one room fills the
+    // building's footprint with every edge on the building's outer wall, and the ceiling goes to the top of the walls. One edit, so one Ctrl+Z takes it all back.
+    // Returns { ok, r, ceilH, edges, tall } or { need: 'model' | 'building' | 'size' }.
+    IM.autoRooms = function () {
+        if (!IM.targetModel() || !IM.comp) return { need: 'model' };
+        const ids = IM.selComps ? [...IM.selComps] : (IM.comp.comps.length === 1 ? [0] : null); if (!ids) return { need: 'building' };
+        const fit = IM.fitFrame(ids), r3 = (v) => Math.round(v * 1000) / 1000; let res = { need: 'size' };
+        Model.edit(P => {
+            P.import.frame = { x: fit.x, y: fit.y, z: fit.z, heading: fit.heading };
+            const hx = (fit.maxx - fit.minx) / 2, hy = (fit.maxy - fit.miny) / 2, r = [-hx, -hy, hx, hy], faces = IM.wallFaces(), zTop = Math.min(fit.size[2], 4);
+            let edges = 0;
+            // each edge goes to the plane with the most outward-looking wall behind it, up to 2 m inside the outline (eaves and overhangs reach further out than the walls)
+            for (let side = 0; side < 4; side++) {
+                const horiz = side === 0 || side === 2, dir = side < 2 ? -1 : 1, edge = r[side], a0 = horiz ? r[1] : r[0], a1 = horiz ? r[3] : r[2], bins = new Map();
+                for (const f of faces) {
+                    if ((horiz ? f.n[0] : f.n[1]) * dir < 0.95) continue;
+                    const pl = horiz ? f.c[0] : f.c[1], into = (edge - pl) * dir; if (into < -0.05 || into > 2) continue;
+                    if (f.c[2] < -0.2 || f.c[2] > zTop) continue;
+                    const ac = horiz ? f.c[1] : f.c[0]; if (ac < a0 - 0.05 || ac > a1 + 0.05) continue;
+                    const k = Math.round(pl * 100); let b = bins.get(k); if (!b) bins.set(k, b = { w: 0, s: 0 }); b.w += f.area; b.s += pl * f.area;
+                }
+                let best = null;                                                            // (a plane can fall across two 1 cm bins: neighbours count together)
+                bins.forEach((b, k) => { const n = [bins.get(k - 1), b, bins.get(k + 1)].filter(Boolean), w = n.reduce((a, x) => a + x.w, 0); if (!best || w > best.w) best = { w, s: n.reduce((a, x) => a + x.s, 0) }; });
+                if (best && best.w >= 0.4) { r[side] = best.s / best.w; edges++; }
+            }
+            const rr = r.map(r3); if (rr[2] - rr[0] < 1 || rr[3] - rr[1] < 1) return;
+            P.shell.ops = [{ op: 'add', r: rr }];
+            IM.fitRooms(0.25).forEach(f => { P.shell.ops[f.op].r[f.side] = f.to; });
+            const wt = IM.wallTop(), tall = wt != null && wt > 4;                           // (walls of several floors in one face: the ceiling is left as it is)
+            if (wt != null && !tall) P.settings.ceilH = Math.max(2.2, wt);
+            res = { ok: true, r: P.shell.ops[0].r, ceilH: P.settings.ceilH, edges, tall };
+        });
+        return res;
+    };
+    // The doors and windows of the building found by their textures: upright flat patches of a window, glass or door texture on the building's walls next to the rooms are
+    // cut out, the way a click of the Door or Window tool cuts them (a door: a door texture, or reaching down to the floor and at least 1.7 m high). One edit.
+    // Returns { windows, doors } (both 0 when nothing was found) or { need: 'model' | 'rooms' }.
+    IM.autoOpenings = function () {
+        const m = IM.targetModel(); if (!m) return { need: 'model' };
+        const P = S.project, I = P.import, ops = P.shell.ops.filter(o => o.op === 'add'); if (!ops.length) return { need: 'rooms' };
+        const H = P.settings.ceilH || 2.45, dels = delSet(), taken = new Set(), WIN = /window|glass|glaz/i, DOOR = /door/i, made = [];
+        I.cutters.forEach(k => { if (k.face) k.face.tris.forEach(t => taken.add(k.face.g + ':' + t)); });
+        // the point is on the wall line of a room: within 60 cm of one of its edges, along that edge, between the floor and a little over the ceiling
+        const onRoomWall = (s) => s[2] > -0.1 && s[2] < H + 0.3 && ops.some(o => { const r = o.r, ny = s[1] > r[1] - 0.6 && s[1] < r[3] + 0.6, nx = s[0] > r[0] - 0.6 && s[0] < r[2] + 0.6;
+            return (ny && (Math.abs(s[0] - r[0]) < 0.6 || Math.abs(s[0] - r[2]) < 0.6)) || (nx && (Math.abs(s[1] - r[1]) < 0.6 || Math.abs(s[1] - r[3]) < 0.6)); });
+        m.geoms.forEach((g, gi) => {
+            const name = (g.texName || '') + ' ' + (g.shader || ''); if (!WIN.test(name) && !DOOR.test(name)) return;
+            const mem = IM.member ? IM.member[gi] : null;
+            for (let t = 0; t * 3 < g.idx.length; t++) {
+                const key = g.g + ':' + t; if (taken.has(key) || dels.has(key) || (mem && !mem[t])) continue;
+                const v = [0, 1, 2].map(q => { const i = g.idx[t * 3 + q] * 3; return IM.toShell(g.pos[i], g.pos[i + 1], g.pos[i + 2]); });
+                const e1 = [v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]], e2 = [v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]], nz = e1[0] * e2[1] - e1[1] * e2[0], l = Math.hypot(e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], nz);
+                if (l < 1e-6 || Math.abs(nz / l) > 0.3) continue;
+                if (!onRoomWall([(v[0][0] + v[1][0] + v[2][0]) / 3, (v[0][1] + v[1][1] + v[2][1]) / 3, (v[0][2] + v[1][2] + v[2][2]) / 3])) continue;
+                const tris = IM.flatPatch(g.g, t).filter(x => !dels.has(g.g + ':' + x) && !taken.has(g.g + ':' + x)); tris.forEach(x => taken.add(g.g + ':' + x));
+                const r = IM.faceRect({ g: g.g, tris }); if (!r || r.w < 0.3 || r.h < 0.3 || r.w > 4 || r.h > 3.2) continue;
+                const type = DOOR.test(name) || (r.zb < 0.25 && r.h >= 1.7) ? 'door' : 'window', k = Object.assign({ id: Math.random().toString(36).slice(2, 7), type, mesh: false, face: { g: g.g, tris, added: [] } }, r);
+                if (type === 'door' && IM.doorModel() && I.placeDoors !== false) { k.leaf = true; k.flip = false; k.lo = 0; }
+                k.dd = IM.frameDepth(k, new Set(tris.map(x => g.g + ':' + x))); made.push(k);
+            }
+        });
+        if (made.length) Model.edit(Q => { made.forEach(k => { k.face.tris.forEach(tr => { Q.import.deletes.push([k.face.g, tr]); k.face.added.push(tr); }); Q.import.cutters.push(k); }); });
+        return { windows: made.filter(k => k.type === 'window').length, doors: made.filter(k => k.type === 'door').length };
+    };
+    // ceiling lights: one about every 3.5 m in every room rectangle, on the 5 cm grid, not in a cut-out and not where a light already hangs. Returns how many were added.
+    IM.autoLights = function () {
+        const sh = S.project.shell, cuts = sh.ops.filter(o => o.op === 'cut'), add = [], have = (sh.lights || []).slice();
+        sh.ops.forEach(o => {
+            if (o.op !== 'add') return; const r = o.r, nx = Math.max(1, Math.round((r[2] - r[0]) / 3.5)), ny = Math.max(1, Math.round((r[3] - r[1]) / 3.5));
+            for (let i = 0; i < nx; i++) for (let j = 0; j < ny; j++) {
+                const x = Math.round((r[0] + (r[2] - r[0]) * (i + 0.5) / nx) / 0.05) * 0.05, y = Math.round((r[1] + (r[3] - r[1]) * (j + 0.5) / ny) / 0.05) * 0.05;
+                if (cuts.some(c => x > c.r[0] && x < c.r[2] && y > c.r[1] && y < c.r[3]) || have.some(l => Math.hypot(l.x - x, l.y - y) < 1)) continue;
+                const p = { x: Math.round(x * 1000) / 1000, y: Math.round(y * 1000) / 1000 }; add.push(p); have.push(p);
+            }
+        });
+        if (add.length) Model.edit(P => { P.shell.lights = (P.shell.lights || []).concat(add); });
+        return add.length;
+    };
 
     // ---------- parts: the materials (geometries) of the building and of its detail models ----------
     // A part is one geometry of a model: all the faces that share a texture. Removing a part deletes all of its faces (in the building: through `deletes`, like

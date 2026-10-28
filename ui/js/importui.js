@@ -402,9 +402,104 @@ window.MLO = window.MLO || {};
     }
 
     // ---------------- Build tab ----------------
+    // the one-button setup: grid, floor, one room on the building's outer walls, ceiling (IM.autoRooms). With a block of buildings and none picked yet, the next
+    // click with Select building picks one and runs it.
+    // Returns 'ok', 'wait' (a building has to be clicked first; `then` says what runs after the click) or false.
+    UI2.autoSetup = async function (then) {
+        const P = S.project;
+        if (!IM.targetModel()) { toast('Import the model first (Import tab).', 'warn'); return false; }
+        if (!IM.selComps && IM.comp && IM.comp.comps.length > 1) { S.autoAfterPick = then || 'setup'; M.App.setTool('building'); toast('Click the building you want: ' + (then === 'all' ? 'everything else is then done by itself.' : 'the grid, floor, walls and ceiling are then set up by themselves.'), 'ok'); return 'wait'; }
+        if (P.shell.ops.length && !(await M.UI.confirm('Replace your rooms?', 'Auto setup makes one room that fills the building. The ' + P.shell.ops.length + ' room rectangle' + (P.shell.ops.length === 1 ? '' : 's') + ' you have now ' + (P.shell.ops.length === 1 ? 'is' : 'are') + ' replaced. Ctrl+Z brings ' + (P.shell.ops.length === 1 ? 'it' : 'them') + ' back.', 'Replace'))) return false;
+        const r = IM.autoRooms();
+        if (!r.ok) { toast(r.need === 'size' ? 'The building is too small to put a room in. Pick the building with Select building (B) and try again.' : 'Import the model first (Import tab).', 'warn'); M.UI.renderLeft(); return false; }
+        S.opSel = null; M.App.frameAll(); M.UI.renderLeft(); M.UI.renderRight();
+        toast('Grid squared to the building, floor set, room ' + f2(r.r[2] - r.r[0]) + ' x ' + f2(r.r[3] - r.r[1]) + ' m with ' + r.edges + ' of 4 edges on the walls, ceiling ' + f2(r.ceilH) + ' m' + (r.tall ? ' (kept: the walls are taller than one floor)' : '') + '. Cut out or add rooms for an L-shape; Ctrl+Z undoes it all.', 'ok');
+        return 'ok';
+    };
+    // after a click with Select building that an Auto button waited for
+    UI2.autoAfterPick = async function (mode) { if (mode === 'all') await UI2.autoAll(true); else await UI2.autoSetup(); };
+    // rooms: close the gaps between them, then put every edge on the building's walls
+    UI2.autoRoomsTidy = function () {
+        if (!S.project.shell.ops.some(o => o.op === 'add')) return UI2.autoSetup();
+        IT.fillAll(); const r = IM.fitRooms(0.25, true); M.UI.renderLeft();
+        toast(r.length ? 'Moved ' + r.length + ' room edge' + (r.length === 1 ? '' : 's') + ' onto the walls.' : 'The rooms already sit on the walls.', 'ok');
+    };
+    // doors and windows found by their textures (IM.autoOpenings)
+    UI2.autoOpenings = function (quiet) {
+        const r = IM.autoOpenings();
+        if (r.need) { if (!quiet) toast(r.need === 'rooms' ? 'Draw the rooms first: openings are looked for on the walls around them.' : 'Import the model first (Import tab).', 'warn'); return 0; }
+        const n = r.windows + r.doors; M.UI.renderLeft();
+        if (!quiet || n) toast(n ? 'Cut out ' + r.windows + ' window' + (r.windows === 1 ? '' : 's') + ' and ' + r.doors + ' door' + (r.doors === 1 ? '' : 's') + ' found by their textures. Check them in the Openings list; Ctrl+Z gives the faces back.' : 'No window, glass or door textures on the walls around the rooms. Click them with the Door (4) and Window (5) tools instead.', n ? 'ok' : 'warn');
+        return n;
+    };
+    // the building's collision and occlusion files from the game, and the collision cleared out of the rooms
+    UI2.autoCollision = async function (quiet) {
+        const I = imp(); if (!I.target || !I.entity) { if (!quiet) toast('Say where the model stands in the game first (Import tab, Placement).', 'warn'); return 0; }
+        if (!quiet) toast('Looking up the collision and occlusion files in the game...', 'ok');
+        const body = { target: I.target, gta: '', entity: I.entity }, names = [];
+        try { const r = await Model.api('import/game-collision?name=' + encName(), 'POST', body); colList = r.files || []; colList.forEach(c => { if (!c.known || c.overlaps) names.push(c.name); }); } catch (e) { colErr = e.message; }
+        try { const r = await Model.api('import/game-occlusion?name=' + encName(), 'POST', body); occList = r.files || []; occList.forEach(c => { if (c.near > 0) names.push(c.name); }); } catch (e) { occErr = e.message; }
+        const add = names.filter(n => !haveFile(n));
+        if (I.clearCollision === false || I.occluders === false) Model.edit(Q => { delete Q.import.clearCollision; delete Q.import.occluders; });
+        if (add.length) { try { await Model.api('import/game-add?name=' + encName(), 'POST', { names: add, gta: '' }); await afterFilesChanged(); } catch (e) { toast(e.message, 'err'); return 0; } }
+        else UI2.refresh();
+        if (!quiet || add.length) toast(add.length ? 'Added ' + add.length + ' collision / occlusion file(s); the collision inside the rooms is cleared.' : 'No new collision or occlusion files to add.', add.length ? 'ok' : 'warn');
+        return add.length;
+    };
+    // the map's props and plants: looked up, and the rules hide the ones in the rooms and in front of the openings
+    UI2.autoPlants = async function (quiet) {
+        const I = imp(); if (!I.target || !I.entity) { if (!quiet) toast('Say where the model stands in the game first (Import tab, Placement).', 'warn'); return 0; }
+        await M.Plants.lookup(document.createElement('div'), document.createElement('button'));
+        const n = M.Plants.hideList().length; if (!quiet) toast(M.Plants.err ? M.Plants.err : n + ' prop(s) and plant(s) in the way will be hidden. Open Props and plants (Y) to change the picks.', M.Plants.err ? 'warn' : 'ok');
+        return n;
+    };
+    UI2.autoLights = function (quiet) {
+        const n = IM.autoLights(); M.UI.renderLeft();
+        if (!quiet || n) toast(n ? 'Hung ' + n + ' ceiling light' + (n === 1 ? '' : 's') + ' (about one every 3.5 m).' : 'Every room already has its lights (or there are no rooms).', n ? 'ok' : 'warn');
+        return n;
+    };
+    UI2.autoWalk = async function () { if (!S.project.shell.ops.some(o => o.op === 'add')) { toast('Draw the rooms first.', 'warn'); return; } await M.Walk.run(); toast(M.Walk.done() ? 'Walk check passed.' : (M.Walk.note || 'The walk check found problems: open the Walk check tool (U) to see them.'), M.Walk.done() ? 'ok' : 'warn'); };
+    // every stage in a row: setup (when there are no rooms yet), gaps and fit, openings, collision, props, lights, walk check
+    let autoBusy = false;
+    UI2.autoAll = async function (picked) {
+        if (autoBusy) return; const P = S.project;
+        if (!P.shell.ops.some(o => o.op === 'add')) { const s = await UI2.autoSetup('all'); if (s !== 'ok') return; }
+        else if (!picked && !(await M.UI.confirm('Do everything?', 'Your rooms are kept. The gaps between them are filled and their edges fitted to the walls, the doors and windows with window, glass or door textures are cut out, the collision and occlusion files are added, the props in the way are hidden, lights are hung and the walk check is run. Each part can be undone with Ctrl+Z.', 'Do it'))) return;
+        autoBusy = true; const done = [];
+        try {
+            IT.fillAll(); IM.fitRooms(0.25, true);
+            const o = UI2.autoOpenings(true); done.push(o + ' opening(s)');
+            const hasPlace = !!(imp().target && imp().entity);
+            if (hasPlace) { toast('Looking up collision, occlusion and props in the game files...', 'ok'); done.push((await UI2.autoCollision(true)) + ' collision/occlusion file(s)'); done.push((await UI2.autoPlants(true)) + ' prop(s) hidden'); }
+            done.push(UI2.autoLights(true) + ' light(s)');
+            await M.Walk.run();
+            toast('Done: ' + done.join(', ') + '. Walk check: ' + (M.Walk.done() ? 'passed.' : 'see the Walk check tool (U).') + (hasPlace ? '' : ' Set where the model stands (Import tab) for the collision and props.') + (o ? '' : ' No openings were found by texture: cut one with the Door or Window tool.'), 'ok');
+        } catch (e) { toast('Auto stopped: ' + e.message, 'err'); }
+        autoBusy = false; M.UI.renderLeft();
+    };
+    // the Auto button of each stage of the route
+    const STAGE_AUTO = {
+        set: ['Auto: grid and floor (+ room and ceiling)', () => UI2.autoSetup()],
+        rooms: ['Auto: rooms on the walls, gaps filled', () => UI2.autoRoomsTidy()],
+        open: ['Auto: cut out the doors and windows', () => UI2.autoOpenings()],
+        repair: ['Auto: add and clear the collision', () => UI2.autoCollision()],
+        props: ['Auto: hide the props in the way', () => UI2.autoPlants()],
+        finish: ['Auto: hang the lights', () => UI2.autoLights()],
+        check: ['Auto: run the walk check', () => UI2.autoWalk()]
+    };
+    function quickSetup(root) {
+        const sh = S.project.shell, fit = IM.loaded && IM.targetModel() && sh.ops.some(o => o.op === 'add') ? IM.fitRooms() : null;
+        root.append(el('div', { class: 'h' }, 'Quick setup'));
+        root.append(el('button', { class: 'btn primary', style: { width: '100%', padding: '8px' }, title: 'Every stage in a row: grid, floor, room, ceiling, doors and windows, collision, props, lights and the walk check', disabled: autoBusy ? true : null, onclick: () => UI2.autoAll() }, autoBusy ? 'Working...' : 'Do everything automatically'));
+        root.append(el('button', { class: 'btn', style: { width: '100%', padding: '6px', marginTop: '6px' }, title: 'Square the grid to the building, set the floor, put one room on its outer walls and match the ceiling', onclick: () => UI2.autoSetup() }, 'Auto: grid, floor, walls and ceiling'));
+        if (fit) root.append(el('div', { class: 'row', style: { marginTop: '6px' } },
+            el('button', { class: 'btn sm' + (fit.length ? ' primary' : ''), disabled: fit.length ? null : true, title: 'Move each room edge onto the building\'s wall within 25 cm of it', onclick: () => { const r = IM.fitRooms(0.25, true); toast(r.length ? 'Moved ' + r.length + ' room edge' + (r.length === 1 ? '' : 's') + ' onto the walls.' : 'Nothing to move.', r.length ? 'ok' : 'warn'); M.UI.renderLeft(); } }, 'Fit rooms to the walls'),
+            el('span', { class: 'note grow', style: { margin: 0 } }, fit.length ? fit.length + ' edge' + (fit.length === 1 ? '' : 's') + ' off the walls' : 'all edges on the walls')));
+    }
     UI2.renderBuild = function (root) {
         const P = S.project, I = P.import, sh = P.shell, t = S.shellTool, k = kit();
         buildingPicker(root);
+        quickSetup(root);
         // the route: numbered stages that open like dropdowns (the one with the active tool is open), then the pointer tools and the cutaway in one row
         const cr = rowOf(t); if (cr) (S.lastVar = S.lastVar || {})[cr.id] = t;
         root.append(el('div', { class: 'h' }, 'Route and tools'));
@@ -778,13 +873,13 @@ window.MLO = window.MLO || {};
         add('model', 'must', 'Import the model', IM.targetModel(), { tab: 'import' }, 'Import tab: add the .ydr, .ytd and collision files of the building.');
         if (IM.comp && IM.comp.comps && IM.comp.comps.length > 1) add('building', 'opt', 'Select the building', IM.selComps, { tool: 'building' }, 'The model holds a whole block: pick the one building so the grid fits it.');
         add('place', 'must', 'Say where the model stands in the game', I.entity, { tab: 'import' }, 'Import tab, Placement. Export needs it.');
-        add('grid', 'must', 'Set the grid on the building\'s floor', f.x || f.y || f.z || f.heading, { tool: 'frame' }, 'Frame tool: click a floor and a wall (Select building does it too).');
+        add('grid', 'must', 'Set the grid on the building\'s floor', f.x || f.y || f.z || f.heading, { tool: 'frame' }, 'Press "Auto: grid, floor, walls and ceiling" at the top of the Build tab, or use the Frame tool: click a floor and a wall.');
         add('rooms', 'must', 'Draw the rooms', hasRooms, { tool: 'room' }, 'Add room: drag rectangles inside the building.');
         add('open', 'must', 'Cut out a door or a window', hasCut || (Model.bldAll(P).length === 1 && I.deletes.length > 0), { tool: 'door' }, 'Door or Window tool: click the faces of a door or window. Otherwise the model stays closed.');
         // (no step for choosing a door model any more: doors come from the Window / door models tool; the old Door tool's doors stay open until a .ydr is chosen for them in the Import tab, and that is optional)
         if (hasCut) add('col', 'should', 'Import the building\'s collision', ncol > 0, { tab: 'import' }, 'Without it the walls stay solid and the openings cannot be walked through.');
         if (hasRooms && IM.targetModel() && IM.colInside) { const c = IM.colInside; add('colclear', 'should', 'The building\'s collision is out of the rooms', P.import.clearCollision !== false || c.now === 0, { tool: 'room' }, c.now + ' pieces of the building\'s own collision would block you inside the rooms: turn on "Clear the building\'s collision inside the rooms" in the right panel.'); }
-        if (hasRooms && IM.targetModel()) { const off = IM.fitRooms(); add('fit', 'should', 'Room edges lie on the building\'s walls', off.length === 0, { tool: 'room' }, off.length + ' room edge(s) are not on a wall of the building: press "Fit rooms to the walls" in the Build tab.'); }
+        if (hasRooms && IM.targetModel()) { const off = IM.fitRooms(); add('fit', 'should', 'Room edges lie on the building\'s walls', off.length === 0, { tool: 'room' }, off.length + ' room edge(s) are not on a wall of the building: press "Fit rooms to the walls" under Quick setup at the top of the Build tab.'); }
         if (hasRooms && IM.targetModel()) { const b = Shell.build(P, { mode: 'export', autoLights: false }); add('portal', 'should', 'Make the inside visible from outside', b.portals.length > 0, { tool: 'door' }, 'A door or window of your interior must meet an opening of the model.'); }
         add('lights', 'should', 'Place lights', lights > 0, { tool: 'light' }, 'Light tool: click the floor. Only the lights you place are exported.');
         if (hasRooms && IM.targetModel() && M.Walk) add('walk', 'opt', 'Walk through the interior (optional Walk check)', M.Walk.done(), { tool: 'walk' }, M.Walk.result ? (M.Walk.stale() ? 'The project changed since the last walk check: run it again.' : 'The walk check found problems: see the list in the Walk check tool.') : 'Walk check tool: tests that you can reach every room and pass every doorway, and that you cannot walk out through a gap.');
@@ -832,6 +927,7 @@ window.MLO = window.MLO || {};
             if (!isOpen) return;
             const body = el('div', { class: 'secbody' });
             body.append(el('div', { class: 'note', style: { margin: '2px 0 6px' } }, st.note));
+            const au = STAGE_AUTO[st.id]; if (au) body.append(el('button', { class: 'btn sm primary', style: { width: '100%', marginBottom: '6px' }, onclick: () => au[1]() }, au[0]));
             if (stat) stat.open.forEach(s => body.append(stepRow(s)));
             const rows = el('div', { class: 'toollist' });
             st.rows.forEach(id => {

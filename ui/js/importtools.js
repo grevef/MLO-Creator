@@ -160,6 +160,7 @@ window.MLO = window.MLO || {};
         }
         const ids = IM.selectBuilding(h.g, h.tri, add); if (!ids) return;
         IM.rebuildMembers(); if (add) return;
+        if (S.autoAfterPick) { const mode = S.autoAfterPick; S.autoAfterPick = false; await M.ImportUI.autoAfterPick(mode); return; }          // an Auto button waited for this pick
         let center = true;
         if (content && !isNew) center = await M.UI.confirm('Move the grid onto this building?', 'Your rooms, cutters and lights keep their positions on the grid, so they move with it. Cancel keeps the grid where it is (the building stays selected).', 'Move the grid');
         if (center) IM.centerOnBuilding();
